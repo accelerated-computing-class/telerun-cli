@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+from functools import partial
 from pathlib import Path
 import urllib
 import urllib.parse
@@ -20,6 +21,8 @@ import socket  # for socket.timeout exception
 import errno  # for errno.ECONNRESET exception
 import dataclasses as dc
 import certifi
+
+print_err = partial(print, file=sys.stderr)
 
 
 @dc.dataclass
@@ -56,9 +59,11 @@ class Conf:
             "cu": "cuda",
         }
     )
+
     @staticmethod
     def mock():
         return Conf("", "")
+
     @property
     def script_dir(self):
         return self.script_file.parent
@@ -92,14 +97,14 @@ class Conf:
                     config = json.load(fd)
                     for i in ("username", "token"):
                         if i not in config:
-                            print(f"{i} not in config file {file}", file=sys.stderr)
-                            raise ValueError
+                            print_err(f"{i} not in config file {file}")
+                            exit(1)
                     return Conf(**config)
 
             except FileNotFoundError:
                 pass
-        print("Could not find config file", file=sys.stderr)
-        raise ValueError
+        print_err("Could not find config file")
+        exit(1)
 
     def get_out_dir(self, out: str | None, job_id):
         return (
@@ -161,23 +166,23 @@ class Context:
                 # Otherwise, raise the error.
                 do_retry = False
                 if isinstance(e.reason, socket.timeout):
-                    print("Failed to connect to server (timeout), retrying...")
+                    print_err("Failed to connect to server (timeout), retrying...")
                     do_retry = True
                 elif (
                     isinstance(e.reason, OSError) and e.reason.errno == errno.ECONNRESET
                 ):
                     # Handle "Connection reset by peer" error.
-                    print(
+                    print_err(
                         "Failed to connect to server (broken connection), retrying..."
                     )
                     do_retry = True
                 elif isinstance(e.reason, ConnectionRefusedError):
-                    print(
+                    print_err(
                         "Failed to connect to server (connection refused), retrying..."
                     )
                     do_retry = True
                 elif isinstance(e.reason, ssl.SSLError):
-                    print(
+                    print_err(
                         f"Failed to connect to server, SSL error: {e.reason}; Is your certificate valid?"
                     )
                     exit(
@@ -189,9 +194,6 @@ class Context:
                     retry_cnt += 1
                     time.sleep((int)(self.conf.retry_backoff_factor * (2**retry_cnt)))
                 else:
-                    print(f"failed @ url {url} {e.reason}", file=sys.stderr)
-                    if isinstance(e, urllib.error.HTTPError):
-                        print(f"{e.read().decode()}", file=sys.stderr)
                     raise e
 
     def request_version(ctx):
@@ -202,18 +204,15 @@ class Context:
         if response["latest_user"] != ctx.conf.version:
             supported = ctx.conf.at_least_version(response["compat_user"])
             if supported:
-                print(
-                    f"A new Telerun client version is available (version {response['latest_user']})",
-                    file=sys.stderr,
+                print_err(
+                    f"A new Telerun client version is available (version {response['latest_user']})"
                 )
             else:
-                print(
+                print_err(
                     f"Version {ctx.conf.version} of the Telerun client is no longer supported",
-                    file=sys.stderr,
                 )
-            print(
+            print_err(
                 "\nTo update, pull the latest commit from the Telerun repository\n",
-                file=sys.stderr,
             )
             # # Work in progress:
             # print(
@@ -244,10 +243,7 @@ class Context:
 
     def get_job_spec(ctx, args, *, cond):
         if args.latest and args.job_id is not None:
-            print(
-                "Arguments '--latest' and '<job_id>' are mutually exclusive",
-                file=sys.stderr,
-            )
+            print_err("Arguments '--latest' and '<job_id>' are mutually exclusive")
             exit(1)
 
         if args.latest:
@@ -261,7 +257,7 @@ class Context:
         elif args.job_id is not None:
             return args.job_id
         else:
-            print("Missing argument '<job_id>' or '--latest'", file=sys.stderr)
+            print_err("Missing argument '<job_id>' or '--latest'")
             exit(1)
 
 
@@ -294,21 +290,18 @@ def submit_handler(args):
                 supported_platforms = ", ".join(
                     repr(platform) for platform in conf.platforms
                 )
-                print(
+                print_err(
                     f"Could not infer platform from filename {os.path.basename(args.file)!r}\n"
                     f"Supported filenames: {supported_filenames}\n"
                     "\n"
                     "You can also specify the platform explicitly with '--platform'\n"
-                    f"Supported platforms: {supported_platforms}\n",
-                    end="",
-                    file=sys.stderr,
+                    f"Supported platforms: {supported_platforms}",
                 )
                 exit(1)
     elif args.platform not in conf.platforms:
-        print(
+        print_err(
             f"Unsupported platform {args.platform!r}\n"
-            f"Supported platforms: {', '.join(repr(platform) for platform in conf.platforms)}\n",
-            end="",
+            f"Supported platforms: {', '.join(repr(platform) for platform in conf.platforms)}",
             file=sys.stderr,
         )
         exit(1)
@@ -348,16 +341,23 @@ def submit_handler(args):
             use_auth=True,
         )
     except urllib.error.HTTPError as e:
-        if e.code == 400:
-            response_json = json.load(e)
+        try:
+            body = e.fp.read().decode()
+            response_json = json.loads(body)
             if response_json.get("error") == "pending_job":
-                print(
-                    "You already have a pending job\n"
-                    "Pass '--force' if you want to replace it\n",
-                    end="",
-                    file=sys.stderr,
+                print_err(
+                    "You already have a pending job. Pass '--force' if you want to replace it",
                 )
-                exit(1)
+            else:
+                print_err(f"Got msg {response_json}")
+
+        except json.JSONDecodeError:
+            print_err(f"Got msg {e.msg} {body}")
+        except Exception:
+            print(f"Failed with code {e.code} {e.msg}")
+        exit(1)
+        raise
+    except urllib.error.URLError as e:
         raise
 
     assert submit_response["success"] is True
