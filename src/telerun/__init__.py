@@ -370,7 +370,7 @@ def submit_handler(args):
     # if args.async_:
     #     return
 
-    out_dir = conf.get_out_dir(args.out, job_id)
+    out_dir: Path | None = conf.get_out_dir(args.out, job_id) if args.store_output else None
 
     milestones_specs = {
         "compile_claim": "compiling",
@@ -438,7 +438,7 @@ def submit_handler(args):
                 output_archive_base64 = output_archive_response["output"].get(
                     "output_tar_gz"
                 )
-                if output_archive_base64 is not None:
+                if out_dir is not None and output_archive_base64 is not None:
                     output_archive = base64.b64decode(output_archive_base64)
                     os.makedirs(out_dir, exist_ok=True)
                     with io.BytesIO(output_archive) as output_archive_f:
@@ -455,7 +455,7 @@ def submit_handler(args):
                     )
                     assert output_asm_response["success"] is True
                     output_asm = output_asm_response["output"].get("compiled_asm_sass")
-                    if output_asm is not None:
+                    if out_dir is not None and  output_asm is not None:
                         os.makedirs(out_dir, exist_ok=True)
                         with open(os.path.join(out_dir, "asm-sass.txt"), "w") as f:
                             f.write(output_asm)
@@ -470,13 +470,13 @@ def submit_handler(args):
                     )
                     assert output_asm_response["success"] is True
                     output_asm = output_asm_response["output"].get("compiled_ptx")
-                    if output_asm is not None:
+                    if out_dir is not None and output_asm is not None:
                         os.makedirs(out_dir, exist_ok=True)
                         with open(os.path.join(out_dir, "asm-ptx.txt"), "w") as f:
                             f.write(output_asm)
 
             curr_state = (
-                status["curr_phase"],
+                status["curr_phase"],\
                 status["claimed"],
                 status["completion_status"],
             )
@@ -500,11 +500,12 @@ def submit_handler(args):
                     milestone_log = log_response["output"][key]
                     if milestone_log is None:
                         milestone_log = ""
-                    os.makedirs(out_dir, exist_ok=True)
-                    with open(
-                        os.path.join(out_dir, key.replace("_", "-")) + ".txt", "w"
-                    ) as f:
-                        f.write(milestone_log)
+                    if out_dir is not None:
+                        os.makedirs(out_dir, exist_ok=True)
+                        with open(
+                            os.path.join(out_dir, key.replace("_", "-")) + ".txt", "w"
+                        ) as f:
+                            f.write(milestone_log)
                     if milestone_log.strip():
                         print(
                             f"{timestamp()}    {log_milestone_specs[milestone]['msg']}:"
@@ -689,6 +690,9 @@ def add_out_dir_arg(parser):
     parser.add_argument(
         "--out",
         help="directory to which to write job output (defaults to './telerun-out/<job_id>' in the current working directory)",
+    )
+    parser.add_argument(
+        "--store-output", action=argparse.BooleanOptionalAction, default=True
     )
 
 
