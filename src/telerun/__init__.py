@@ -2,6 +2,7 @@
 
 import argparse
 from functools import partial
+from http.client import IncompleteRead
 from pathlib import Path
 import urllib
 import urllib.parse
@@ -175,6 +176,9 @@ class Context:
                     print_err(
                         "Failed to connect to server (broken connection), retrying..."
                     )
+                    do_retry = True
+                elif isinstance(e.reason, IncompleteRead):
+                    print_err("Content truncated, retrying...")
                     do_retry = True
                 elif isinstance(e.reason, ConnectionRefusedError):
                     print_err(
@@ -357,7 +361,7 @@ def submit_handler(args):
             print(f"Failed with code {e.code} {e.msg}")
         exit(1)
         raise
-    except urllib.error.URLError as e:
+    except urllib.error.URLError:
         raise
 
     assert submit_response["success"] is True
@@ -370,7 +374,9 @@ def submit_handler(args):
     # if args.async_:
     #     return
 
-    out_dir: Path | None = conf.get_out_dir(args.out, job_id) if args.store_output else None
+    out_dir: Path | None = (
+        conf.get_out_dir(args.out, job_id) if args.store_output else None
+    )
 
     milestones_specs = {
         "compile_claim": "compiling",
@@ -455,7 +461,7 @@ def submit_handler(args):
                     )
                     assert output_asm_response["success"] is True
                     output_asm = output_asm_response["output"].get("compiled_asm_sass")
-                    if out_dir is not None and  output_asm is not None:
+                    if out_dir is not None and output_asm is not None:
                         os.makedirs(out_dir, exist_ok=True)
                         with open(os.path.join(out_dir, "asm-sass.txt"), "w") as f:
                             f.write(output_asm)
@@ -476,7 +482,7 @@ def submit_handler(args):
                             f.write(output_asm)
 
             curr_state = (
-                status["curr_phase"],\
+                status["curr_phase"],
                 status["claimed"],
                 status["completion_status"],
             )
