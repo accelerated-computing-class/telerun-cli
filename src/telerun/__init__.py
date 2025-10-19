@@ -5,12 +5,14 @@ from functools import partial
 from http.client import IncompleteRead
 from pathlib import Path
 import urllib
+import urllib.error
 import urllib.parse
 import urllib.request
 import ssl
 import os
 import json
 import traceback
+import typing as tp
 import time
 import base64
 import sys
@@ -22,12 +24,71 @@ import socket  # for socket.timeout exception
 import errno  # for errno.ECONNRESET exception
 import dataclasses as dc
 import certifi
-
+import copy
+import re
+unsafe = re.compile(r"([^A-Za-z0-9_\-])")
 print_err = partial(print, file=sys.stderr)
+
+default_platforms = {
+    "x86_64",
+    "cuda",
+    "h100",
+}
+# TODO: for next year, set it up properly
+default_files: list[str] = [
+    "rle_raw.bmp",
+    "test_256x256x256_a.bin",
+    "test_256x256x256_b.bin",
+    "test_256x256x256_c.bin",
+    "test_3072x3072x3072_a.bin",
+    "test_3072x3072x3072_b.bin",
+    "test_3072x3072x3072_c.bin",
+    "test_a_1024x3072.bin",
+    "test_a_128x3072.bin",
+    "test_a_128x32768.bin",
+    "test_a_16x3072.bin",
+    "test_a_1x3072.bin",
+    "test_a_2048x3072.bin",
+    "test_a_256x1024.bin",
+    "test_a_256x256.bin",
+    "test_a_256x3072.bin",
+    "test_a_256x8192.bin",
+    "test_a_3072x3072.bin",
+    "test_a_32x3072.bin",
+    "test_a_512x3072.bin",
+    "test_a_64x3072.bin",
+    "test_b_1024x256.bin",
+    "test_b_256x256.bin",
+    "test_b_3072x3072.bin",
+    "test_b_32768x128.bin",
+    "test_b_8192x256.bin",
+    "test_c_1024x3072x3072.bin",
+    "test_c_128x128x32768.bin",
+    "test_c_128x3072x3072.bin",
+    "test_c_16x3072x3072.bin",
+    "test_c_1x3072x3072.bin",
+    "test_c_2048x3072x3072.bin",
+    "test_c_256x256x1024.bin",
+    "test_c_256x256x256.bin",
+    "test_c_256x256x8192.bin",
+    "test_c_256x3072x3072.bin",
+    "test_c_3072x3072x3072.bin",
+    "test_c_32x3072x3072.bin",
+    "test_c_512x3072x3072.bin",
+    "test_c_64x3072x3072.bin",
+]
 
 
 @dc.dataclass
 class Conf:
+    def __post_init__(self):
+        for i in self.platform_has_ptx:
+            assert i in self.platforms
+        for i in self.platform_has_asm:
+            assert i in self.platforms
+        for i in self.filename_platforms.values():
+            assert i in self.platforms
+
     username: str
     token: str
     url: str = "https://telerun.accelerated-computing.io"
@@ -48,18 +109,24 @@ class Conf:
     )
 
     platforms: set[str] = dc.field(
-        default_factory=lambda: {
-            "x86_64",
-            "cuda",
-        }
+        default_factory=lambda: copy.deepcopy(default_platforms)
     )
 
     filename_platforms: dict[str, str] = dc.field(
         default_factory=lambda: {
             "cpp": "x86_64",
+            "cc": "x86_64",
             "cu": "cuda",
         }
     )
+
+    platform_has_asm: set[str] = dc.field(
+        default_factory=lambda: copy.deepcopy(default_platforms)
+    )
+
+    platform_has_ptx: set[str] = dc.field(default_factory=lambda: {"cuda", "h100"})
+
+    workspace_files: list[str] | None = None
 
     @staticmethod
     def mock():
@@ -269,6 +336,9 @@ def timestamp():
     return datetime.now().strftime("%Y-%m-%d %I:%M %p")
 
 
+comms_start = ["// TL", "# TL", "% TL"]
+
+
 def submit_handler(args):
     # # Work in progress:
     # if args.async_ and args.out is not None:
@@ -278,40 +348,7 @@ def submit_handler(args):
     conf = Conf.from_file(args.conf)
     ctx = conf.ctx
     ctx.check_version()
-
-    if args.platform is None:
-        for k, v in conf.filename_platforms.items():
-            if args.file.endswith(k):
-                platform = v
-                break
-        else:
-            if args.file.endswith(".tar"):
-                platform = "cuda"
-            else:
-                supported_filenames = ", ".join(
-                    f"'*.{ext}'" for ext in conf.filename_platforms.keys()
-                )
-                supported_platforms = ", ".join(
-                    repr(platform) for platform in conf.platforms
-                )
-                print_err(
-                    f"Could not infer platform from filename {os.path.basename(args.file)!r}\n"
-                    f"Supported filenames: {supported_filenames}\n"
-                    "\n"
-                    "You can also specify the platform explicitly with '--platform'\n"
-                    f"Supported platforms: {supported_platforms}",
-                )
-                exit(1)
-    elif args.platform not in conf.platforms:
-        print_err(
-            f"Unsupported platform {args.platform!r}\n"
-            f"Supported platforms: {', '.join(repr(platform) for platform in conf.platforms)}",
-            file=sys.stderr,
-        )
-        exit(1)
-    else:
-        platform = args.platform
-
+    file_attrs = dict[tp.Any, tp.Any]()
     is_tarball = args.file.endswith(".tar")
     if is_tarball:
         # If source is a tarball, read as binary and encode here.
@@ -321,10 +358,63 @@ def submit_handler(args):
         # Read as a text file.
         with open(args.file, "r") as f:
             source = f.read()
+            for x in map(str.strip, source.splitlines()):
+                for i in comms_start:
+                    if x.startswith(i):
+                        file_attrs.update(json.loads(f"{{{x[len(i) :]}}}"))
+
+    if args.platform is None:
+        if "platform" in file_attrs:
+            platform = file_attrs["platform"]
+        else:
+            for k, v in conf.filename_platforms.items():
+                if args.file.endswith(k):
+                    platform = v
+                    break
+            else:
+                if args.file.endswith(".tar"):
+                    platform = "cuda"
+                else:
+                    supported_filenames = ", ".join(
+                        f"'*.{ext}'" for ext in conf.filename_platforms.keys()
+                    )
+                    supported_platforms = ", ".join(
+                        repr(platform) for platform in conf.platforms
+                    )
+                    print_err(
+                        f"Could not infer platform from filename {os.path.basename(args.file)!r}\n"
+                        f"Supported filenames: {supported_filenames}\n"
+                        "\n"
+                        "You can also specify the platform explicitly with '--platform'\n"
+                        f"Supported platforms: {supported_platforms}",
+                    )
+                    exit(1)
+    elif args.platform not in conf.platforms:
+        print_err(
+            f"Unsupported platform {args.platform!r}\n"
+            f"Supported platforms: {', '.join(repr(platform) for platform in conf.platforms)}",
+            file=sys.stderr,
+        )
+        exit(1)
+    else:
+        platform = args.platform
+    assert isinstance(platform, str) and platform in conf.platforms
+    
+    if (_workspace_files :=  args.workspace_files) is None:
+        if (workspace_files := file_attrs.get("workspace_files")) is None:
+            workspace_files = default_files
+    else:
+        workspace_files = _workspace_files.split(',')
+
+    assert isinstance(workspace_files, list)
+    for i in workspace_files:
+        assert isinstance(i, str)
+        assert unsafe.search(i) is None, f"file {i} contains a character that is not alphanumeric or dash or underscore."
 
     options = {
         "args": args.args,
         "generate_asm": args.asm,
+        "workspace_files": workspace_files,
         "tarball": is_tarball,
     }
 
@@ -452,7 +542,7 @@ def submit_handler(args):
                             tar.extractall(out_dir, filter="data")
 
                 # Get asm/sass if requested.
-                if args.asm and (platform == "x86_64" or platform == "cuda"):
+                if platform in conf.platform_has_asm and args.asm:
                     output_asm_response = ctx.request(
                         "GET",
                         "/api/output",
@@ -467,7 +557,7 @@ def submit_handler(args):
                             f.write(output_asm)
 
                 # Get ptx if requested.
-                if args.asm and platform == "cuda":
+                if platform in conf.platform_has_ptx and args.asm:
                     output_asm_response = ctx.request(
                         "GET",
                         "/api/output",
@@ -746,6 +836,7 @@ def main():
         ),
         choices=list(mock_conf.platforms),  # type:ignore
     )
+    submit_parser.add_argument("--workspace_files", help="list of files that the executor must make available, comma seperated list", type=str)
     submit_parser.add_argument("file", help="source file to submit")
     submit_parser.add_argument(
         "args", nargs=argparse.REMAINDER, help="arguments for your program"
