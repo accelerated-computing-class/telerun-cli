@@ -336,10 +336,25 @@ def submit_handler(args):
                         x = x[len(i) :].strip()
                         if x.startswith("TL"):
                             x = x[2:]
+                            if x[0] == "+":
+                                bump = True
+                                x = x[1:]
+                            else:
+                                bump = False
                             logger.debug("parsing %s", x)
                             delta = json.loads(x)
-                            logger.debug("conf delta is %s", delta)
-                            file_attrs.update(delta)
+                            assert isinstance(delta, dict)
+                            logger.debug("conf delta (bump=%s) is  %s", bump, delta)
+                            for k, v in delta.items():
+                                if (
+                                    (k not in file_attrs)
+                                    or (not bump)
+                                    or (not isinstance(v, list))
+                                ):
+                                    logger.info("k=%s v=%s", k, v)
+                                    file_attrs[k] = v
+                                else:
+                                    file_attrs[k].extend(v)
                             logger.debug("file attrs became %s", file_attrs)
 
                             break
