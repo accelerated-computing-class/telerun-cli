@@ -141,9 +141,9 @@ class Conf:
                             exit(1)
                     return Conf(**config)
 
-            except FileNotFoundError:
+            except OSError:
                 pass
-        print_err("Could not find config file")
+        print_err("Could not find config file. Please run 'telerun login' first.")
         exit(1)
 
     def get_out_dir(self, out: str | None, job_id):
@@ -678,7 +678,7 @@ def cancel_handler(args):
 
 
 def version_handler(args):
-    conf = Conf.from_file(args.conf)
+    conf = Conf.from_file(getattr(args, 'conf', None))
     ctx = conf.ctx
     ctx.check_version()
 
@@ -884,6 +884,7 @@ def main():
     version_parser = subparsers.add_parser(
         "version", help="print the version of the client and check for updates"
     )
+    add_auth_arg(version_parser)
     version_parser.add_argument(
         "--offline", action="store_true", help="do not check for updates"
     )
