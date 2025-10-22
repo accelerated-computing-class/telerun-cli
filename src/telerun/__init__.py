@@ -3,6 +3,7 @@
 import argparse
 from functools import partial
 from http.client import IncompleteRead
+import logging
 from pathlib import Path
 import urllib
 import urllib.error
@@ -26,57 +27,28 @@ import dataclasses as dc
 import certifi
 import copy
 import re
-unsafe = re.compile(r"([^A-Za-z0-9_\-])")
+
+unsafe = re.compile(r"([^A-Za-z0-9_\-\.])")
 print_err = partial(print, file=sys.stderr)
+
+
+def set_logging(level=logging.WARNING):
+    logging.basicConfig(
+        format="[%(asctime)s][%(filename)s:%(lineno)d][%(levelname)s] - %(message)s",
+        datefmt="%m/%d/%Y %I:%M:%S %p",
+        stream=sys.stderr,
+        level=level,
+    )
+
+
+set_logging(logging.DEBUG if os.getenv("TELERUN_DEBUG") == "1" else logging.INFO)
+logger = logging.getLogger("telerun-cli")
 
 default_platforms = {
     "x86_64",
     "cuda",
     "h100",
 }
-# TODO: for next year, set it up properly
-default_files: list[str] = [
-    "rle_raw.bmp",
-    "test_256x256x256_a.bin",
-    "test_256x256x256_b.bin",
-    "test_256x256x256_c.bin",
-    "test_3072x3072x3072_a.bin",
-    "test_3072x3072x3072_b.bin",
-    "test_3072x3072x3072_c.bin",
-    "test_a_1024x3072.bin",
-    "test_a_128x3072.bin",
-    "test_a_128x32768.bin",
-    "test_a_16x3072.bin",
-    "test_a_1x3072.bin",
-    "test_a_2048x3072.bin",
-    "test_a_256x1024.bin",
-    "test_a_256x256.bin",
-    "test_a_256x3072.bin",
-    "test_a_256x8192.bin",
-    "test_a_3072x3072.bin",
-    "test_a_32x3072.bin",
-    "test_a_512x3072.bin",
-    "test_a_64x3072.bin",
-    "test_b_1024x256.bin",
-    "test_b_256x256.bin",
-    "test_b_3072x3072.bin",
-    "test_b_32768x128.bin",
-    "test_b_8192x256.bin",
-    "test_c_1024x3072x3072.bin",
-    "test_c_128x128x32768.bin",
-    "test_c_128x3072x3072.bin",
-    "test_c_16x3072x3072.bin",
-    "test_c_1x3072x3072.bin",
-    "test_c_2048x3072x3072.bin",
-    "test_c_256x256x1024.bin",
-    "test_c_256x256x256.bin",
-    "test_c_256x256x8192.bin",
-    "test_c_256x3072x3072.bin",
-    "test_c_3072x3072x3072.bin",
-    "test_c_32x3072x3072.bin",
-    "test_c_512x3072x3072.bin",
-    "test_c_64x3072x3072.bin",
-]
 
 
 @dc.dataclass
@@ -336,7 +308,7 @@ def timestamp():
     return datetime.now().strftime("%Y-%m-%d %I:%M %p")
 
 
-comms_start = ["// TL", "# TL", "% TL"]
+comms_start = ["//", "#", "%"]
 
 
 def submit_handler(args):
@@ -361,7 +333,16 @@ def submit_handler(args):
             for x in map(str.strip, source.splitlines()):
                 for i in comms_start:
                     if x.startswith(i):
-                        file_attrs.update(json.loads(f"{{{x[len(i) :]}}}"))
+                        x = x[len(i) :].strip()
+                        if x.startswith("TL"):
+                            x = x[2:]
+                            logger.debug("parsing %s", x)
+                            delta = json.loads(x)
+                            logger.debug("conf delta is %s", delta)
+                            file_attrs.update(delta)
+                            logger.debug("file attrs became %s", file_attrs)
+
+                            break
 
     if args.platform is None:
         if "platform" in file_attrs:
@@ -399,29 +380,37 @@ def submit_handler(args):
     else:
         platform = args.platform
     assert isinstance(platform, str) and platform in conf.platforms
-    
-    if (_workspace_files :=  args.workspace_files) is None:
-        if (workspace_files := file_attrs.get("workspace_files")) is None:
-            workspace_files = default_files
-    else:
-        workspace_files = _workspace_files.split(',')
-
-    assert isinstance(workspace_files, list)
-    for i in workspace_files:
-        assert isinstance(i, str)
-        assert unsafe.search(i) is None, f"file {i} contains a character that is not alphanumeric or dash or underscore."
 
     options = {
         "args": args.args,
         "generate_asm": args.asm,
-        "workspace_files": workspace_files,
         "tarball": is_tarball,
     }
 
+    if (_workspace_files := args.workspace_files) is None:
+        workspace_files = file_attrs.get("workspace_files")
+    else:
+        workspace_files = _workspace_files.split(",")
+    if isinstance(workspace_files, list):
+        for i in workspace_files:
+            assert unsafe.search(i) is None, (
+                f"file {i} contains a character that is not alphanumeric or dash or underscore."
+            )
+        options["workspace_files"] = workspace_files
+    else:
+        assert workspace_files is None
+
+    if args.sanitizer is not None:
+        if platform in conf.platform_has_ptx:
+            assert args.sanitizer in ["memcheck", "racecheck", "synccheck", "initcheck"]
+            options["sanitizer"] = args.sanitizer
+        else:
+            msg = f"platform {platform} does not have sanitizers"
+            raise NotImplementedError(msg)
     submit_query_args = {}
     if args.force:
         submit_query_args["override_pending"] = "1"
-
+    logger.debug("submit options %s", options)
     try:
         submit_response = ctx.request(
             "POST",
@@ -836,7 +825,16 @@ def main():
         ),
         choices=list(mock_conf.platforms),  # type:ignore
     )
-    submit_parser.add_argument("--workspace_files", help="list of files that the executor must make available, comma seperated list", type=str)
+    submit_parser.add_argument(
+        "--workspace_files",
+        help="list of files that the executor must make available, comma seperated list",
+        type=str,
+    )
+    submit_parser.add_argument(
+        "--sanitizer",
+        help="sanitizer to use. For cuda we support {memcheck,racecheck,initcheck,synccheck}. See `compute-sanitizer` docs.",
+        type=str,
+    )
     submit_parser.add_argument("file", help="source file to submit")
     submit_parser.add_argument(
         "args", nargs=argparse.REMAINDER, help="arguments for your program"
