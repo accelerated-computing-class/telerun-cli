@@ -99,6 +99,7 @@ class Conf:
     platform_has_ptx: set[str] = dc.field(default_factory=lambda: {"cuda", "h100"})
 
     workspace_files: list[str] | None = None
+    link: list[str] | None = None
 
     @staticmethod
     def mock():
@@ -402,18 +403,25 @@ def submit_handler(args):
         "tarball": is_tarball,
     }
 
-    if (_workspace_files := args.workspace_files) is None:
-        workspace_files = file_attrs.get("workspace_files")
-    else:
-        workspace_files = _workspace_files.split(",")
-    if isinstance(workspace_files, list):
+    if (
+        len(
+            workspace_files := [
+                *args.workspace_file,
+                *file_attrs.get("workspace_files", []),
+            ]
+        )
+        > 0
+    ):
         for i in workspace_files:
             assert unsafe.search(i) is None, (
                 f"file {i} contains a character that is not alphanumeric or dash or underscore."
             )
+        logger.debug("workspace_files=%s", workspace_files)
         options["workspace_files"] = workspace_files
     else:
-        assert workspace_files is None
+        logger.debug("workspace_files is empty")
+    options["compile_flags"] = [*(f"-{i}" for i in args.X), *file_attrs.get("compile_flags", [])]
+    logger.debug("compile_flags is %s", options["compile_flags"])
 
     if args.sanitizer is not None:
         if platform in conf.platform_has_ptx:
@@ -841,14 +849,21 @@ def main():
         choices=list(mock_conf.platforms),  # type:ignore
     )
     submit_parser.add_argument(
-        "--workspace_files",
-        help="list of files that the executor must make available, comma seperated list",
-        type=str,
+        "--workspace_file",
+        help="Files to be included in the workspace, can be used multiple times",
+        default=[],
+        action="append",
     )
     submit_parser.add_argument(
         "--sanitizer",
         help="sanitizer to use. For cuda we support {memcheck,racecheck,initcheck,synccheck}. See `compute-sanitizer` docs.",
         type=str,
+    )
+    submit_parser.add_argument(
+        "-X",
+        action="append",
+        default=[],
+        help="Compiler flag to be appended, can be used multiple times",
     )
     submit_parser.add_argument("file", help="source file to submit")
     submit_parser.add_argument(
