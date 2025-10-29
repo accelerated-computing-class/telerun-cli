@@ -98,8 +98,9 @@ class Conf:
 
     platform_has_ptx: set[str] = dc.field(default_factory=lambda: {"cuda", "h100"})
 
-    workspace_files: list[str] | None = None
-    link: list[str] | None = None
+    workspace_files: list[str] = dc.field(default_factory=list)
+    header_files: list[str] = dc.field(default_factory=list)
+    link: list[str] = dc.field(default_factory=list)
 
     @staticmethod
     def mock():
@@ -331,10 +332,10 @@ def submit_handler(args):
         # Read as a text file.
         with open(args.file, "r") as f:
             source = f.read()
-            for x in map(str.strip, source.splitlines()):
+            for line in map(str.strip, source.splitlines()):
                 for i in comms_start:
-                    if x.startswith(i):
-                        x = x[len(i) :].strip()
+                    if line.startswith(i):
+                        x = line[len(i) :].strip()
                         if x.startswith("TL"):
                             x = x[2:]
                             if x[0] == "+":
@@ -343,7 +344,12 @@ def submit_handler(args):
                             else:
                                 bump = False
                             logger.debug("parsing %s", x)
-                            delta = json.loads(x)
+                            try:
+                                delta = json.loads(x)
+                            except json.JSONDecodeError:
+                                logger.error(
+                                    "failed to parse telerun directive %s", line
+                                )
                             assert isinstance(delta, dict)
                             logger.debug("conf delta (bump=%s) is  %s", bump, delta)
                             for k, v in delta.items():
@@ -352,7 +358,6 @@ def submit_handler(args):
                                     or (not bump)
                                     or (not isinstance(v, list))
                                 ):
-                                    logger.info("k=%s v=%s", k, v)
                                     file_attrs[k] = v
                                 else:
                                     file_attrs[k].extend(v)
@@ -403,15 +408,11 @@ def submit_handler(args):
         "tarball": is_tarball,
     }
 
-    if (
-        len(
-            workspace_files := [
-                *args.workspace_file,
-                *file_attrs.get("workspace_files", []),
-            ]
-        )
-        > 0
-    ):
+    workspace_files = [
+        *args.workspace_file,
+        *file_attrs.get("workspace_files", []),
+    ]
+    if len(args.workspace_file) > 0 or "workspace_files" in file_attrs:
         for i in workspace_files:
             assert unsafe.search(i) is None, (
                 f"file {i} contains a character that is not alphanumeric or dash or underscore."
@@ -420,7 +421,28 @@ def submit_handler(args):
         options["workspace_files"] = workspace_files
     else:
         logger.debug("workspace_files is empty")
-    options["compile_flags"] = [*(f"-{i}" for i in args.X), *file_attrs.get("compile_flags", [])]
+
+    header_files = [*args.header_file, *file_attrs.get("header_files", [])]
+    work_dir = Path(args.file).parent
+    if len(args.header_file) > 0 or "header_files" in file_attrs:
+        header_sources = {}
+        for h in header_files:
+            p = work_dir / Path(h)
+            p.relative_to
+            logger.debug("trying to open %s %s", h, p)
+            try:
+                with p.open() as fd:
+                    header_sources[str(p.relative_to(work_dir))] = fd.read()
+                    logger.debug("loaded file %s", p)
+            except ValueError:
+                logger.error("file %s is not a child of %s", str(p), str(work_dir))
+            except FileNotFoundError:
+                logger.error("could not find file %s (tried %s)", h, str(p))
+        options["header_sources"] = header_sources
+    options["compile_flags"] = [
+        *(f"-{i}" for i in args.X),
+        *file_attrs.get("compile_flags", []),
+    ]
     logger.debug("compile_flags is %s", options["compile_flags"])
 
     if args.sanitizer is not None:
@@ -433,7 +455,12 @@ def submit_handler(args):
     submit_query_args = {}
     if args.force:
         submit_query_args["override_pending"] = "1"
-    logger.debug("submit options %s", options)
+    short_options = {**options}
+    if "header_sources" in short_options:
+        short_options["header_sources"] = {
+            k: "..." for k in short_options["header_sources"]
+        }
+    logger.debug("submit options %s", short_options)
     try:
         submit_response = ctx.request(
             "POST",
@@ -849,8 +876,14 @@ def main():
         choices=list(mock_conf.platforms),  # type:ignore
     )
     submit_parser.add_argument(
-        "--workspace_file",
-        help="Files to be included in the workspace, can be used multiple times",
+        "--workspace-file",
+        help="Files to be included in the workspace, can be used multiple times. Note that file must exist on telerun server",
+        default=[],
+        action="append",
+    )
+    submit_parser.add_argument(
+        "--header-file",
+        help="Files to be included at compile time, can be used multiple times, path must be relative",
         default=[],
         action="append",
     )
