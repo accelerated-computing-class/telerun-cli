@@ -48,6 +48,7 @@ default_platforms = {
     "x86_64",
     "cuda",
     "h100",
+    "tpu",
 }
 
 
@@ -89,6 +90,7 @@ class Conf:
             "cpp": "x86_64",
             "cc": "x86_64",
             "cu": "cuda",
+            "py": "tpu"
         }
     )
 
